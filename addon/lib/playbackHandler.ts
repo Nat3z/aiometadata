@@ -375,9 +375,37 @@ export async function handlePlaybackReport(
     const { playedThresholdFor } = require('./jellyfin/playstate');
     const watchedAt = await playedThresholdFor(userUUID, config?.jellyfinProfileId ?? null, config);
     await enqueueTrackerWrites(userUUID, config, await planReport(type, id, report, progress, config, watchedAt, userUUID));
+    // AniList hears a start too, outside the outbox, which reads its anime jobs as watches.
+    if (intent === 'watching')
+      startAnime(type, id, require('./accounts').trackerConfig(config, 'anilist'), userUUID).catch((error: any) =>
+        logger.error(`AniList start failed for ${id}: ${error.message}`)
+      );
   }
 
   return { status: 204 };
+}
+
+/** Puts a title being started on the AniList list as watching, unless it is already watching or finished. */
+async function startAnime(type: string, id: string, config: any, userUUID: string): Promise<void> {
+  const { parseMediaId } = require('./subtitleHandler');
+  const { shouldTrackServiceMediaType, normalizeWatchTrackingMediaType } = require('./watchTracking');
+  const anilistTracker = require('./anilistTracker');
+
+  const parsedId = parseMediaId(id);
+  const mediaType = parsedId ? normalizeWatchTrackingMediaType(type, parsedId.type) : null;
+  if (!mediaType || !shouldTrackServiceMediaType(config, 'anilist', mediaType) || !anilistTracker.shouldTrackAniList(config)) return;
+
+  const resolution = await anilistTracker.resolveAniListId(parsedId);
+  const token = resolution && (await anilistTracker.getValidAccessToken(userUUID, require('./accounts').ownTokenId(config, 'anilist')));
+  if (!token) return;
+  const media = await anilistTracker.getMediaStatus(resolution.anilistId, token);
+  const entry = media?.mediaListEntry;
+  if (!media || (entry && !['PLANNING', 'PAUSED', 'DROPPED'].includes(entry.status))) return;
+
+  const progress = entry?.progress || 0;
+  if (anilistTracker.determineStatus(progress, media.episodes) !== 'CURRENT') return;
+  if (await anilistTracker.updateProgress(resolution.anilistId, progress, media.episodes, token))
+    logger.info(`AniList ${resolution.anilistId} set to watching`);
 }
 
 /**
